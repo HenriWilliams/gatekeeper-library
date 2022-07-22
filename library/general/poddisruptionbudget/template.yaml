@@ -19,11 +19,12 @@ spec:
     - target: admission.k8s.gatekeeper.sh
       rego: |
         package k8spoddisruptionbudget
+        
+        has_key(x, k) { _ = x[k] }
 
         violation[{"msg": msg}] {
           input.review.kind.kind == "PodDisruptionBudget"
           pdb := input.review.object
-
           not valid_pdb_max_unavailable(pdb)
           msg := sprintf(
             "PodDisruptionBudget <%v> has maxUnavailable of 0, only positive integers are allowed for maxUnavailable",
@@ -33,40 +34,58 @@ spec:
 
         violation[{"msg": msg}] {
           obj := input.review.object
-          pdb := data.inventory.namespace[obj.metadata.namespace]["policy/v1"].PodDisruptionBudget[_]
-          obj.spec.selector.matchLabels == pdb.spec.selector.matchLabels
-
-          not valid_pdb_max_unavailable(pdb)
+          replicas := obj.spec.replicas
+          replicas > 0
+          pdb := get_pdb(obj)
+          pdb_details := valid_pdb(replicas, pdb.spec)
+          pdb_setting := pdb_details[pdb_type]
           msg := sprintf(
-            "%v <%v> has been selected by PodDisruptionBudget <%v> but has maxUnavailable of 0, only positive integers are allowed for maxUnavailable",
-            [obj.kind, obj.metadata.name, pdb.metadata.name],
+            "%v `%v` with `%v` replicas has PDB `%v` with `%v` set to `%v` which does not allow pods to be evicted",
+            [obj.kind, obj.metadata.name, replicas, pdb.metadata.name, pdb_type, pdb_setting],
           )
         }
-
-        violation[{"msg": msg}] {
-          obj := input.review.object
-          pdb := data.inventory.namespace[obj.metadata.namespace]["policy/v1"].PodDisruptionBudget[_]
+        
+        get_pdb(obj) = pdb {
+          # Scaling requests use a different type so here we need to find the matching deployment before finding the PDB
+          obj.kind == "Scale"
+          deployment := data.inventory.namespace[obj.metadata.namespace][_].Deployment[_]
+          deployment.metadata.name == obj.metadata.name
+          pdb := data.inventory.namespace[obj.metadata.namespace][_].PodDisruptionBudget[_]
+          deployment.spec.selector.matchLabels == pdb.spec.selector.matchLabels
+        }{
+          obj.kind != "Scale"
+          pdb := data.inventory.namespace[obj.metadata.namespace][_].PodDisruptionBudget[_]
           obj.spec.selector.matchLabels == pdb.spec.selector.matchLabels
-
-          not valid_pdb_min_available(obj, pdb)
-          msg := sprintf(
-            "%v <%v> has %v replica(s) but PodDisruptionBudget <%v> has minAvailable of %v, only positive integers less than %v are allowed for minAvailable",
-            [obj.kind, obj.metadata.name, obj.spec.replicas, pdb.metadata.name, pdb.spec.minAvailable, obj.spec.replicas],
-          )
         }
 
-        valid_pdb_min_available(obj, pdb) {
-          # default to -1 if minAvailable is not set so valid_pdb_min_available is always true
-          # for objects with >= 0 replicas. If minAvailable defaults to >= 0, objects with
-          # replicas field might violate this constraint if they are equal to the default set here
-          min_available := object.get(pdb.spec, "minAvailable", -1)
-          obj.spec.replicas > min_available
+        valid_pdb(replicas, pdb) = out {
+          has_key(pdb, "minAvailable")
+          out = valid_pdb_min_available(replicas, pdb)
+        }{
+          has_key(pdb, "maxUnavailable")
+          out = valid_pdb_max_unavailable(pdb)
         }
-
-        valid_pdb_max_unavailable(pdb) {
-          # default to 1 if maxUnavailable is not set so valid_pdb_max_unavailable always returns true.
-          # If maxUnavailable defaults to 0, it violates this constraint because all pods needs to be
-          # available and no pods can be evicted voluntarily
-          max_unavailable := object.get(pdb.spec, "maxUnavailable", 1)
-          max_unavailable > 0
+        
+        valid_pdb_min_available(replicas, pdb) = out {
+          # Calculate minAvailable if it's a percentage
+          endswith(pdb.minAvailable, "%")
+          minAvailable = ceil(to_number(trim_suffix(pdb.minAvailable, "%"))/100 * replicas)
+          minAvailable >= replicas
+          out = {"minAvailable": pdb.minAvailable}
+        }{
+          not endswith(pdb.minAvailable, "%")
+          pdb.minAvailable >= replicas
+          out = {"minAvailable": pdb.minAvailable}
+        }
+        
+        valid_pdb_max_unavailable(pdb) = out {
+          # Calculate maxUnavailable if it's a percentage
+          endswith(pdb.maxUnavailable, "%")
+          maxUnavailable = to_number(trim_suffix(pdb.maxUnavailable, "%"))
+          maxUnavailable == 0
+          out = {"maxUnavailable": pdb.maxUnavailable}
+        }{
+         not endswith(pdb.maxUnavailable, "%")
+         pdb.maxUnavailable == 0
+         out = {"maxUnavailable": pdb.maxUnavailable}
         }
